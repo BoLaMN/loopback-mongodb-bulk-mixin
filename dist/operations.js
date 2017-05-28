@@ -161,6 +161,22 @@ Bulk = (function() {
     this.curr.documents.push(data);
   };
 
+  Bulk.prototype.normalizeId = function(model, inst) {
+    var data, idName, idValue;
+    data = (typeof inst.toObject === "function" ? inst.toObject() : void 0) || inst;
+    idName = model.definition._ids[0].name;
+    idValue = data._id;
+    if (idValue === null || idValue === void 0) {
+      delete data._id;
+    } else {
+      data[idName] = idValue;
+    }
+    if (idName !== '_id') {
+      delete data._id;
+    }
+    return data;
+  };
+
   Bulk.prototype.rewriteId = function(model, inst) {
     var data, idName, idValue;
     data = (typeof inst.toObject === "function" ? inst.toObject() : void 0) || inst;
@@ -178,16 +194,17 @@ Bulk = (function() {
   };
 
   Bulk.prototype.execute = function(options, callback) {
-    var broadcast, db, hookState, removeErrored, result, rewriteId;
+    var broadcast, db, hookStates, normalizeId, removeErrored, result, rewriteId;
     if (options == null) {
       options = {};
     }
     if (callback == null) {
       callback = function() {};
     }
-    hookState = {};
+    hookStates = {};
     db = this.db;
     rewriteId = this.rewriteId;
+    normalizeId = this.normalizeId;
     result = {
       inserted: [],
       matched: 0,
@@ -195,11 +212,14 @@ Bulk = (function() {
       removed: 0,
       upserted: 0
     };
-    removeErrored = function(arr, indexes) {
-      var i, index;
+    removeErrored = function(cmd, key, indexes) {
+      var arr, hooks, i, index, item;
       if (!(indexes != null ? indexes.length : void 0)) {
         return;
       }
+      item = keys[key];
+      arr = cmd[item];
+      hooks = hookStates[item];
       indexes.sort(function(a, b) {
         return a - b;
       });
@@ -207,6 +227,7 @@ Bulk = (function() {
       while (i < indexes.length) {
         index = indexes[i] - i;
         arr.splice(index, 1);
+        hooks.splice(index, 1);
         i++;
       }
     };
@@ -215,6 +236,9 @@ Bulk = (function() {
         var finish, inc, insert, item, key, notify, remove, update;
         key = Object.keys(cmd)[0];
         item = keys[key];
+        if (hookStates[item] == null) {
+          hookStates[item] = [];
+        }
         notify = function(model, type, context) {
           return new Promise(function(resolve, reject) {
             return model.notifyObserversOf(phase + ' ' + type, context, function(err, ctx) {
@@ -246,7 +270,12 @@ Bulk = (function() {
         insert = function() {
           var model;
           model = loopback.getModel(cmd.insert);
-          return Promise.map(cmd[item], function(data) {
+          return Promise.map(cmd[item], function(data, index) {
+            var base, hookState;
+            if (phase === 'after') {
+              normalizeId(model, data);
+            }
+            hookState = (base = hookStates[item])[index] != null ? base[index] : base[index] = {};
             return notify(model, 'save', {
               Model: model,
               instance: data,
@@ -254,14 +283,18 @@ Bulk = (function() {
               hookState: hookState,
               options: options
             }).tap(inc).then(function(ctx) {
-              return rewriteId(model, ctx.instance);
+              if (phase === 'before') {
+                return rewriteId(model, ctx.instance);
+              }
             });
           });
         };
         update = function() {
           var model;
           model = loopback.getModel(cmd.update);
-          return Promise.map(cmd[item], function(obj) {
+          return Promise.map(cmd[item], function(obj, index) {
+            var base, hookState;
+            hookState = (base = hookStates[item])[index] != null ? base[index] : base[index] = {};
             return notify(model, 'save', {
               Model: model,
               where: obj.q,
@@ -277,7 +310,9 @@ Bulk = (function() {
         remove = function() {
           var model;
           model = loopback.getModel(cmd["delete"]);
-          return Promise.map(cmd[item], function(obj) {
+          return Promise.map(cmd[item], function(obj, index) {
+            var base, hookState;
+            hookState = (base = hookStates[item])[index] != null ? base[index] : base[index] = {};
             return notify(model, 'delete', {
               Model: model,
               where: obj.q,
@@ -316,7 +351,7 @@ Bulk = (function() {
             var key, ref;
             if ((ref = res.writeErrors) != null ? ref.length : void 0) {
               key = Object.keys(cmd)[0];
-              removeErrored(cmd[keys[key]], res.writeErrors.map(function(error) {
+              removeErrored(cmd, key, res.writeErrors.map(function(error) {
                 return error.index;
               }));
               if (result.errors == null) {

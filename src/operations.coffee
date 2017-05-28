@@ -124,6 +124,22 @@ class Bulk
 
     return
 
+  normalizeId: (model, inst) ->
+    data = inst.toObject?() or inst 
+
+    idName = model.definition._ids[0].name
+    idValue = data._id
+
+    if idValue is null or idValue is undefined
+      delete data._id
+    else
+      data[idName] = idValue
+
+    if idName isnt '_id'
+      delete data._id
+
+    data
+
   rewriteId: (model, inst) ->
     data = inst.toObject?() or inst 
 
@@ -141,10 +157,12 @@ class Bulk
     data
 
   execute: (options = {}, callback = ->) ->
-    hookState = {}
+    hookStates = {}
 
     db = @db 
+    
     rewriteId = @rewriteId
+    normalizeId = @normalizeId
 
     result = 
       inserted: []
@@ -153,19 +171,26 @@ class Bulk
       removed: 0
       upserted: 0
 
-    removeErrored = (arr, indexes) ->
+    removeErrored = (cmd, key, indexes) ->
       if not indexes?.length 
         return 
 
+      item = keys[key]
+
+      arr = cmd[item]
+      hooks = hookStates[item]
+
       indexes.sort (a, b) ->
         a - b
-        
+      
       i = 0
       
       while i < indexes.length
         index = indexes[i] - i
-        arr.splice index, 1
         
+        arr.splice index, 1
+        hooks.splice index, 1
+
         i++
       
       return
@@ -173,6 +198,8 @@ class Bulk
     broadcast = (phase, cmd, cb) =>  
       key = Object.keys(cmd)[0]
       item = keys[key] 
+
+      hookStates[item] ?= [] 
 
       notify = (model, type, context) ->
         new Promise (resolve, reject) ->
@@ -200,7 +227,12 @@ class Bulk
       insert = ->
         model = loopback.getModel cmd.insert 
 
-        Promise.map cmd[item], (data) ->
+        Promise.map cmd[item], (data, index) ->
+          if phase is 'after'
+            normalizeId model, data
+
+          hookState = hookStates[item][index] ?= {}
+
           notify model, 'save',
             Model: model
             instance: data
@@ -209,12 +241,15 @@ class Bulk
             options: options
           .tap inc
           .then (ctx) ->
-            rewriteId model, ctx.instance
+            if phase is 'before'
+              rewriteId model, ctx.instance
 
       update = ->
         model = loopback.getModel cmd.update 
 
-        Promise.map cmd[item], (obj) ->
+        Promise.map cmd[item], (obj, index) ->
+          hookState = hookStates[item][index] ?= {}
+
           notify model, 'save',
             Model: model
             where: obj.q
@@ -229,7 +264,9 @@ class Bulk
       remove = ->
         model = loopback.getModel cmd.delete 
 
-        Promise.map cmd[item], (obj) ->
+        Promise.map cmd[item], (obj, index) ->
+          hookState = hookStates[item][index] ?= {}
+          
           notify model, 'delete',
             Model: model
             where: obj.q
@@ -262,7 +299,7 @@ class Bulk
           db.command cmd, (err, res) ->
             if res.writeErrors?.length
               key = Object.keys(cmd)[0]
-              removeErrored cmd[keys[key]], res.writeErrors.map (error) ->
+              removeErrored cmd, key, res.writeErrors.map (error) ->
                 error.index
               result.errors ?= {}
               result.errors[key] = res.writeErrors
