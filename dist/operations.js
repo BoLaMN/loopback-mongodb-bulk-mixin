@@ -52,14 +52,18 @@ Bulk = (function() {
   };
 
   Bulk.prototype._find = function(query) {
-    var buildWhere, parseUpdateData, ref;
-    ref = this.model.getConnector(), buildWhere = ref.buildWhere, parseUpdateData = ref.parseUpdateData;
-    query = buildWhere(query);
+    var connector, modelName;
+    connector = this.model.getConnector();
+    modelName = this.model.modelName;
+    query = connector.buildWhere(modelName, query);
     return {
       remove: (function(_this) {
-        return function(arg) {
+        return function(options) {
           var limit, model, multi;
-          multi = arg.multi, model = arg.model;
+          if (options == null) {
+            options = {};
+          }
+          multi = options.multi, model = options.model;
           if (!_this.curr) {
             _this.curr = {
               "delete": model || _this.colName,
@@ -92,10 +96,12 @@ Bulk = (function() {
         };
       })(this),
       update: (function(_this) {
-        return function(upd, arg) {
-          var data, model, multi, upsert;
-          multi = arg.multi, upsert = arg.upsert, model = arg.model;
-          data = parseUpdateData(upd);
+        return function(data, options) {
+          var model, multi, upsert;
+          if (options == null) {
+            options = {};
+          }
+          multi = options.multi, upsert = options.upsert, model = options.model;
           if (!_this.curr) {
             _this.curr = {
               update: model || _this.colName,
@@ -161,9 +167,8 @@ Bulk = (function() {
     this.curr.documents.push(data);
   };
 
-  Bulk.prototype.normalizeId = function(model, inst) {
-    var data, idName, idValue;
-    data = (typeof inst.toObject === "function" ? inst.toObject() : void 0) || inst;
+  Bulk.prototype.normalizeId = function(model, data) {
+    var idName, idValue;
     idName = model.definition._ids[0].name;
     idValue = data._id;
     if (idValue === null || idValue === void 0) {
@@ -177,9 +182,9 @@ Bulk = (function() {
     return data;
   };
 
-  Bulk.prototype.rewriteId = function(model, inst) {
-    var data, idName, idValue;
-    data = (typeof inst.toObject === "function" ? inst.toObject() : void 0) || inst;
+  Bulk.prototype.rewriteId = function(model, data) {
+    var idName, idValue;
+    data = (typeof inst.toObject === "function" ? inst.toObject(false) : void 0) || inst;
     idName = model.definition._ids[0].name;
     idValue = data[idName];
     if (idValue === null || idValue === void 0) {
@@ -194,17 +199,22 @@ Bulk = (function() {
   };
 
   Bulk.prototype.execute = function(options, callback) {
-    var broadcast, db, hookStates, normalizeId, removeErrored, result, rewriteId;
+    var broadcast, connector, db, hookStates, normalizeId, removeErrored, result, rewriteId;
     if (options == null) {
       options = {};
     }
     if (callback == null) {
       callback = function() {};
     }
+    if (typeof options === 'function') {
+      callback = options;
+      options = {};
+    }
     hookStates = {};
     db = this.db;
     rewriteId = this.rewriteId;
     normalizeId = this.normalizeId;
+    connector = this.model.getConnector();
     result = {
       inserted: [],
       matched: 0,
@@ -256,7 +266,7 @@ Bulk = (function() {
             return;
           }
           if (key === 'insert') {
-            inst = new Model((typeof instance.toObject === "function" ? instance.toObject() : void 0) || instance);
+            inst = new Model((typeof instance.toObject === "function" ? instance.toObject(false) : void 0) || instance);
             inst.setId(instance.id);
             return result.inserted.push(inst);
           } else {
@@ -302,7 +312,9 @@ Bulk = (function() {
               hookState: hookState,
               options: options
             }).tap(inc).then(function(ctx) {
-              obj.u = ctx.data;
+              var modelName;
+              modelName = ctx.Model.modelName;
+              obj.u = connector.parseUpdateData(modelName, ctx.data);
               return obj;
             });
           });
@@ -316,11 +328,10 @@ Bulk = (function() {
             return notify(model, 'delete', {
               Model: model,
               where: obj.q,
-              data: obj.u,
               hookState: hookState,
               options: options
             }).tap(inc).then(function(ctx) {
-              obj.u = ctx.data;
+              obj.q = ctx.where;
               return obj;
             });
           });
@@ -340,40 +351,45 @@ Bulk = (function() {
     if (this.curr) {
       this.cmds.push(this.curr);
     }
-    return async.each(this.cmds, function(cmd, done) {
-      return async.series([
-        function(cb) {
-          debug('before', inspect(cmd, false, null));
-          return broadcast('before', cmd, cb);
-        }, function(cb) {
-          debug('command', inspect(cmd, false, null));
-          return db.command(cmd, function(err, res) {
-            var key, ref;
-            if ((ref = res.writeErrors) != null ? ref.length : void 0) {
-              key = Object.keys(cmd)[0];
-              removeErrored(cmd, key, res.writeErrors.map(function(error) {
-                return error.index;
-              }));
-              if (result.errors == null) {
-                result.errors = {};
+    return async.each(this.cmds, (function(_this) {
+      return function(cmd, done) {
+        return async.series([
+          function(cb) {
+            debug('before', inspect(cmd, false, null));
+            return broadcast('before', cmd, cb);
+          }, function(cb) {
+            debug('command', inspect(cmd, false, null));
+            return db.command(cmd, function(err, res) {
+              var key, ref;
+              if ((ref = res.writeErrors) != null ? ref.length : void 0) {
+                key = Object.keys(cmd)[0];
+                removeErrored(cmd, key, res.writeErrors.map(function(error) {
+                  return error.index;
+                }));
+                if (result.errors == null) {
+                  result.errors = {};
+                }
+                result.errors[key] = res.writeErrors;
               }
-              result.errors[key] = res.writeErrors;
-            }
-            debug('command after', err, res);
-            return cb(err, res);
-          });
-        }, function(cb) {
-          debug('after', inspect(cmd, false, null));
-          return broadcast('after', cmd, cb);
+              debug('command after', err, res);
+              return cb(err, res);
+            });
+          }, function(cb) {
+            debug('after', inspect(cmd, false, null));
+            return broadcast('after', cmd, cb);
+          }
+        ], done);
+      };
+    })(this), (function(_this) {
+      return function(err) {
+        if (err) {
+          callback(err);
         }
-      ], done);
-    }, function(err) {
-      if (err) {
-        callback(err);
-      }
-      result.ok = 1;
-      return callback(null, result);
-    });
+        _this.cmds = [];
+        result.ok = 1;
+        return callback(null, result);
+      };
+    })(this));
   };
 
   return Bulk;

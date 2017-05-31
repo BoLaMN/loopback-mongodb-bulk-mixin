@@ -41,11 +41,15 @@ class Bulk
 
   _find: (query) ->
 
-    { buildWhere, parseUpdateData } = @model.getConnector()
+    connector = @model.getConnector()
 
-    query = buildWhere query 
+    { modelName } = @model 
 
-    remove: ({ multi, model }) =>
+    query = connector.buildWhere modelName, query 
+
+    remove: (options = {}) =>
+      { multi, model } = options
+      
       if not @curr
         @curr =
           delete: model or @colName
@@ -73,8 +77,8 @@ class Bulk
 
       return
 
-    update: (upd, { multi, upsert, model }) =>
-      data = parseUpdateData upd
+    update: (data, options = {}) =>
+      { multi, upsert, model } = options 
 
       if not @curr
         @curr =
@@ -124,9 +128,7 @@ class Bulk
 
     return
 
-  normalizeId: (model, inst) ->
-    data = inst.toObject?() or inst 
-
+  normalizeId: (model, data) ->
     idName = model.definition._ids[0].name
     idValue = data._id
 
@@ -140,8 +142,8 @@ class Bulk
 
     data
 
-  rewriteId: (model, inst) ->
-    data = inst.toObject?() or inst 
+  rewriteId: (model, data) ->
+    data = inst.toObject?(false) or inst 
 
     idName = model.definition._ids[0].name
     idValue = data[idName]
@@ -157,6 +159,10 @@ class Bulk
     data
 
   execute: (options = {}, callback = ->) ->
+    if typeof options is 'function'
+      callback = options
+      options = {}
+
     hookStates = {}
 
     db = @db 
@@ -164,6 +170,8 @@ class Bulk
     rewriteId = @rewriteId
     normalizeId = @normalizeId
 
+    connector = @model.getConnector()
+    
     result = 
       inserted: []
       matched: 0
@@ -213,7 +221,7 @@ class Bulk
           return 
 
         if key is 'insert'
-          inst = new Model instance.toObject?() or instance
+          inst = new Model instance.toObject?(false) or instance
           inst.setId instance.id
 
           result.inserted.push inst
@@ -258,7 +266,8 @@ class Bulk
             options: options
           .tap inc
           .then (ctx) ->
-            obj.u = ctx.data 
+            { modelName } = ctx.Model
+            obj.u = connector.parseUpdateData modelName, ctx.data 
             obj
 
       remove = ->
@@ -270,12 +279,11 @@ class Bulk
           notify model, 'delete',
             Model: model
             where: obj.q
-            data: obj.u
             hookState: hookState
             options: options
           .tap inc
           .then (ctx) ->
-            obj.u = ctx.data 
+            obj.q = ctx.where 
             obj 
 
       Promise.all switch key 
@@ -288,7 +296,7 @@ class Bulk
     if @curr
       @cmds.push @curr
 
-    async.each @cmds, (cmd, done) ->
+    async.each @cmds, (cmd, done) =>
       
       async.series [
         (cb) -> 
@@ -310,10 +318,12 @@ class Bulk
           broadcast 'after', cmd, cb 
       ], done
 
-    , (err) ->
+    , (err) =>
       if err 
         callback err 
 
+      @cmds = [] 
+      
       result.ok = 1
 
       callback null, result
